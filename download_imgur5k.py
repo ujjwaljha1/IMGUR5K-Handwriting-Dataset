@@ -4,18 +4,18 @@ All rights reserved.
 
 This source code is licensed under the license found in the
 LICENSE file in the root directory of this source tree.
-'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 IMGUR5K is shared as a set of image urls with annotations. This code downloads
-th images and verifies the hash to the image to avoid data contamination.
+the images and verifies the hash to the image to avoid data contamination.
 
 Usage:
-      python downloaad_imgur5k.py --dataset_info_dir <dir_with_annotaion_and_hashes> --output_dir <path_to_store_images>
+      python download_imgur5k.py --dataset_info_dir <dir_with_annotation_and_hashes> --output_dir <path_to_store_images>
 
 Output:
-     Images dowloaded to output_dir
-     data_annotations.json : json file with image annotation mappings -> dowloaded to dataset_info_dir
+     Images downloaded to output_dir
+     imgur5k_annotations.json : json file with image annotation mappings -> downloaded to dataset_info_dir
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
 import argparse
@@ -49,7 +49,9 @@ def parse_args():
 
 # Image hash computed for image using md5..
 def compute_image_hash(img_path):
-    return hashlib.md5(open(img_path, 'rb').read()).hexdigest()
+    with open(img_path, 'rb') as f:
+        data = f.read()
+    return hashlib.md5(data).hexdigest()
 
 # Create a sub json based on split idx
 def _create_split_json(anno_json, _split_idx):
@@ -77,44 +79,75 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Create a hash dictionary with image index and its correspond gt hash
+    # User-Agent header to mimic browser
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/113 Safari/537.36"
+    }
+
+    # Create a hash dictionary with image index and its corresponding gt hash
     with open(f"{args.dataset_info_dir}/imgur5k_hashes.lst", "r", encoding="utf-8") as _H:
         hashes = _H.readlines()
         hash_dict = {}
 
-        for hash in hashes:
-            hash_dict[f"{hash.split()[0]}"] = f"{hash.split()[1]}"
-
+        for line in hashes:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                idx, hsh = parts
+                hash_dict[idx] = hsh
 
     tot_evals = 0
     num_match = 0
     invalid_urls = []
-    # Download the urls and save only the ones with valid hash o ensure underlying image has not changed
+
+    # Download the urls and save only the ones with valid hash to ensure underlying image has not changed
     for index in list(hash_dict.keys()):
-        image_url = f'https://i.imgur.com/{index}.jpg'
-        img_data = requests.get(image_url).content
-        if len(img_data) < 100:
+        urls_to_try = [
+            f'https://i.imgur.com/{index}.jpeg',
+            f'https://i.imgur.com/{index}.jpg',
+        ]
+
+        img_data = None
+        for image_url in urls_to_try:
+            try:
+                response = requests.get(image_url, headers=headers, timeout=10)
+                if response.status_code == 200 and len(response.content) > 100:
+                    img_data = response.content
+                    break
+                else:
+                    print(f"Failed to download {image_url}: Status {response.status_code}")
+            except requests.RequestException as e:
+                print(f"Exception downloading {image_url}: {e}")
+
+        if img_data is None:
             print(f"URL retrieval for {index} failed!!\n")
-            invalid_urls.append(image_url)
+            invalid_urls.append(index)
             continue
-        with open(f'{args.output_dir}/{index}.jpg', 'wb') as handler:
+
+        # Save the image
+        image_path = f'{args.output_dir}/{index}.jpg'
+        with open(image_path, 'wb') as handler:
             handler.write(img_data)
 
-        compute_image_hash(f'{args.output_dir}/{index}.jpg')
+        # Compute hash once
+        cur_hash = compute_image_hash(image_path)
         tot_evals += 1
-        if hash_dict[index] != compute_image_hash(f'{args.output_dir}/{index}.jpg'):
-            print(f"For IMG: {index}, ref hash: {hash_dict[index]} != cur hash: {compute_image_hash(f'{args.output_dir}/{index}.jpg')}")
-            os.remove(f'{args.output_dir}/{index}.jpg')
-            invalid_urls.append(image_url)
+
+        if hash_dict[index] != cur_hash:
+            print(f"Hash mismatch for IMG {index} (ref: {hash_dict[index]} != cur: {cur_hash})")
+            os.remove(image_path)
+            invalid_urls.append(index)
             continue
         else:
             num_match += 1
+            print(f"Downloaded and verified {index}")
 
     # Generate the final annotations file
     # Format: { "index_id" : {indexes}, "index_to_annotation_map" : { annotations ids for an index}, "annotation_id": { each annotation's info } }
     # Bounding boxes with '.' mean the annotations were not done for various reasons
 
-    _F = np.loadtxt(f'{args.dataset_info_dir}/imgur5k_data.lst', delimiter="\t", dtype=np.str, encoding="utf-8")
+    _F = np.loadtxt(f'{args.dataset_info_dir}/imgur5k_data.lst', delimiter="\t", dtype=str, encoding="utf-8")
     anno_json = {}
 
     anno_json['index_id'] = {}
@@ -123,12 +156,18 @@ def main():
 
     cur_index = ''
     for cnt, image_url in enumerate(_F[:,0]):
-        if image_url in invalid_urls:
+        # image_url format example: https://i.imgur.com/YsaVkzl.jpg
+        index = image_url.split('/')[-1][:-4]  # remove extension
+
+        if index in invalid_urls:
             continue
 
-        index = image_url.split('/')[-1][:-4]
         if index != cur_index:
-            anno_json['index_id'][index] = {'image_url': image_url, 'image_path': f'{args.output_dir}/{index}.jpg', 'image_hash': hash_dict[index]}
+            anno_json['index_id'][index] = {
+                'image_url': image_url,
+                'image_path': f'{args.output_dir}/{index}.jpg',
+                'image_hash': hash_dict[index]
+            }
             anno_json['index_to_ann_map'][index] = []
 
         ann_id = f"{index}_{len(anno_json['index_to_ann_map'][index])}"
@@ -137,16 +176,22 @@ def main():
 
         cur_index = index
 
-    json.dump(anno_json, open(f'{args.dataset_info_dir}/imgur5k_annotations.json', 'w'), indent=4)
+    with open(f'{args.dataset_info_dir}/imgur5k_annotations.json', 'w') as f:
+        json.dump(anno_json, f, indent=4)
 
     # Now split the annotations json in train, validation and test jsons
     splits = ['train', 'val', 'test']
     for split in splits:
-        _split_idx = np.loadtxt(f'{args.dataset_info_dir}/{split}_index_ids.lst', delimiter="\n", dtype=np.str)
+        split_file = f'{args.dataset_info_dir}/{split}_index_ids.lst'
+        if not os.path.exists(split_file):
+            print(f"Warning: Split file {split_file} not found, skipping split {split}")
+            continue
+        _split_idx = np.loadtxt(split_file, delimiter="\n", dtype=str)
         split_json = _create_split_json(anno_json, _split_idx)
-        json.dump(split_json, open(f'{args.dataset_info_dir}/imgur5k_annotations_{split}.json', 'w'), indent=4)
+        with open(f'{args.dataset_info_dir}/imgur5k_annotations_{split}.json', 'w') as f:
+            json.dump(split_json, f, indent=4)
 
-    print(f"MATCHES: {num_match}/{tot_evals}\n")
+    print(f"Downloaded and verified images: {num_match}/{tot_evals}")
 
 if __name__ == '__main__':
     main()
